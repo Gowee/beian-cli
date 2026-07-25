@@ -2,18 +2,16 @@
 
 import argparse
 import base64
-import http.cookiejar
 import json
 import os
 import re
 import sys
 import time
-import urllib.parse
-import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import cv2
 import numpy as np
+import requests
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
@@ -497,41 +495,49 @@ def _parse_annual_report(html: str) -> dict | None:
     }
 
 
-def query_license_batch(queries: list[str], *, retries: int = 10) -> list[dict]:
+def query_license_batch(queries: list[str], *, retries: int = 10,
+                        verbose: bool = False) -> list[dict]:
     """Query ICP license from tsm.miit.gov.cn for multiple company names."""
     import ddddocr
 
     ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
     ocr.set_ranges("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
-    # Create session with cookie jar
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-    opener.addheaders = [
-        ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-         "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"),
-        ("Referer", "https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp"),
-        ("X-Requested-With", "XMLHttpRequest"),
-    ]
+    # Create session with connection pooling
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "Referer": "https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp",
+        "X-Requested-With": "XMLHttpRequest",
+    })
 
     # Load the page first to establish session
+    if verbose:
+        print("  [init] Loading session...", file=sys.stderr)
     try:
-        page_req = urllib.request.Request("https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp?num=&type=xuke")
-        opener.open(page_req, timeout=10)
+        session.get("https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp",
+                     params={"num": "", "type": "xuke"}, timeout=10)
     except Exception:
         pass
+    if verbose:
+        print("  [init] Session ready", file=sys.stderr)
 
     # Cache for授权_info and年报_info keyed by lic_id
     cache = {"auth": {}, "report": {}}
 
     results = []
-    for query in queries:
-        result = _do_license_query(opener, query, ocr, retries, cache)
+    for i, query in enumerate(queries, 1):
+        if verbose and len(queries) > 1:
+            print(f"\n  [{i}/{len(queries)}] Querying: {query}", file=sys.stderr)
+        result = _do_license_query(session, query, ocr, retries, cache, verbose)
         results.append(result)
+    session.close()
     return results
 
 
-def _do_license_query(opener, company: str, ocr, retries: int, cache: dict) -> dict:
+def _do_license_query(session: requests.Session, company: str, ocr, retries: int,
+                      cache: dict, verbose: bool = False) -> dict:
     """Solve CAPTCHA and query ICP license for one company.
 
     Retry logic: non-7-char OCR results refresh CAPTCHA without counting as
@@ -542,11 +548,12 @@ def _do_license_query(opener, company: str, ocr, retries: int, cache: dict) -> d
         while non7_count < 5:
             try:
                 # Get CAPTCHA
-                data = urllib.parse.urlencode({"num": company}).encode()
-                req = urllib.request.Request(
-                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getCode", data=data)
-                resp = opener.open(req, timeout=10)
-                captcha = json.loads(resp.read())
+                if verbose:
+                    print(f"    [{company[:8]}...] CAPTCHA attempt {attempt}/{retries}...", file=sys.stderr, end=" ")
+                resp = session.post(
+                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getCode",
+                    data={"num": company}, timeout=10)
+                captcha = resp.json()
                 img_bytes = base64.b64decode(captcha["src"].split(",")[1])
 
                 # OCR with edge_sharp preprocessing
@@ -555,31 +562,34 @@ def _do_license_query(opener, company: str, ocr, retries: int, cache: dict) -> d
 
                 if len(code) != 7:
                     non7_count += 1
+                    if verbose:
+                        print(f"OCR='{code}' (len={len(code)}, retrying)", file=sys.stderr)
                     continue
 
                 # Submit
-                data2 = urllib.parse.urlencode({
-                    "num": company, "type": "xuke", "code": code,
-                }).encode()
-                req2 = urllib.request.Request(
+                if verbose:
+                    print(f"OCR='{code}' -> submitting...", file=sys.stderr, end=" ")
+                check = session.post(
                     "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getcorpinfocount.wf",
-                    data=data2)
-                resp2 = opener.open(req2, timeout=10)
-                check = json.loads(resp2.read())
+                    data={"num": company, "type": "xuke", "code": code},
+                    timeout=10).json()
 
                 if check.get("flag") == "0":
+                    if verbose:
+                        print("WRONG CAPTCHA", file=sys.stderr)
                     break  # Wrong CAPTCHA, count this as one failure
 
+                if verbose:
+                    print("OK", file=sys.stderr)
+
                 # Get results
-                data3 = urllib.parse.urlencode({
-                    "num": company, "type": "xuke", "code": code,
-                    "pageNum": 1, "pageSize": 100,
-                }).encode()
-                req3 = urllib.request.Request(
+                if verbose:
+                    print(f"    [{company[:8]}...] Fetching license data...", file=sys.stderr)
+                body = session.post(
                     "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getcorpinfo.wf",
-                    data=data3)
-                resp3 = opener.open(req3, timeout=10)
-                body = json.loads(resp3.read())
+                    data={"num": company, "type": "xuke", "code": code,
+                          "pageNum": 1, "pageSize": 100},
+                    timeout=10).json()
 
                 records = []
                 for item in (body.get("listyj") or []):
@@ -591,49 +601,62 @@ def _do_license_query(opener, company: str, ocr, retries: int, cache: dict) -> d
                     if lic_id:
                         if lic_id in cache["auth"]:
                             authorizations = cache["auth"][lic_id]
+                            if verbose:
+                                print(f"    [{company[:8]}...] 授权 (cached)", file=sys.stderr)
                         else:
+                            if verbose:
+                                print(f"    [{company[:8]}...] Fetching 授权...", file=sys.stderr, end=" ")
                             try:
-                                auth_data = urllib.parse.urlencode({"num": lic_id}).encode()
-                                auth_req = urllib.request.Request(
-                                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getshouquan.wf?pageNum=1&pageSize=100",
-                                    data=auth_data)
-                                auth_resp = opener.open(auth_req, timeout=10)
-                                auth_body = json.loads(auth_resp.read())
+                                auth_body = session.post(
+                                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getshouquan.wf",
+                                    params={"pageNum": 1, "pageSize": 100},
+                                    data={"num": lic_id},
+                                    timeout=10).json()
                                 if isinstance(auth_body, list):
                                     authorizations = auth_body
                                 cache["auth"][lic_id] = authorizations
+                                if verbose:
+                                    print(f"{len(authorizations)} records", file=sys.stderr)
                             except Exception:
                                 cache["auth"][lic_id] = []
+                                if verbose:
+                                    print("error", file=sys.stderr)
 
                     # Fetch年报_info (cached by lic_id)
                     annual_report = None
                     if lic_id:
                         if lic_id in cache["report"]:
                             annual_report = cache["report"][lic_id]
+                            if verbose:
+                                print(f"    [{company[:8]}...] 年报 (cached)", file=sys.stderr)
                         else:
+                            if verbose:
+                                print(f"    [{company[:8]}...] Fetching 年报...", file=sys.stderr, end=" ")
                             fill_year = ""
                             try:
-                                ar_data = urllib.parse.urlencode({"num": lic_id}).encode()
-                                ar_req = urllib.request.Request(
+                                ar_body = session.post(
                                     "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getreporty",
-                                    data=ar_data)
-                                ar_resp = opener.open(ar_req, timeout=10)
-                                ar_body = json.loads(ar_resp.read())
+                                    data={"num": lic_id},
+                                    timeout=10).json()
                                 if ar_body and not ar_body.get("ssss"):
                                     fill_year = ar_body.get("FILL_YEAR", "")
                             except Exception:
                                 pass
                             try:
-                                ar_req2 = urllib.request.Request(
-                                    f"https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyereport.jsp?num={lic_id}&type=yreport")
-                                ar_resp2 = opener.open(ar_req2, timeout=10)
-                                ar_html = ar_resp2.read().decode("utf-8", errors="replace")
+                                ar_html = session.get(
+                                    "https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyereport.jsp",
+                                    params={"num": lic_id, "type": "yreport"},
+                                    timeout=10).text
                                 annual_report = _parse_annual_report(ar_html)
                                 if annual_report:
                                     annual_report["fillYear"] = fill_year
+                                cache["report"][lic_id] = annual_report
+                                if verbose:
+                                    print(f"year={fill_year or 'N/A'}", file=sys.stderr)
                             except Exception:
-                                pass
-                            cache["report"][lic_id] = annual_report
+                                cache["report"][lic_id] = None
+                                if verbose:
+                                    print("error", file=sys.stderr)
 
                     rec = {
                         "companyName": item.get("company_name", ""),
@@ -713,6 +736,8 @@ def main():
     parser.add_argument("--screenshot", nargs="?", const=".", default=None,
                         metavar="DIR",
                         help="Save full-page screenshot (default: current dir)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show progress (ICP license CAPTCHA solving)")
     args = parser.parse_args()
     if not args.query_type:
         args.query_type = "website"
@@ -722,6 +747,7 @@ def main():
         results = query_license_batch(
             args.queries,
             retries=args.retries,
+            verbose=args.verbose,
         )
     else:
         results = query_beian_batch(
