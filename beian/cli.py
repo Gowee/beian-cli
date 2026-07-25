@@ -757,7 +757,8 @@ def main():
                         help="Output raw JSON only, no formatting")
     parser.add_argument("--screenshot", nargs="?", const=".", default=None,
                         metavar="DIR",
-                        help="Save full-page screenshot (default: current dir)")
+                        help="Save full-page screenshot (ICP filing queries only: --website/--app/--miniprogram/--quickapp). "
+                             "Default: current dir if flag used without value")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show progress (CAPTCHA solving, API calls)")
     args = parser.parse_args()
