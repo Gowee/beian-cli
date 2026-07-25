@@ -3,12 +3,32 @@ name = "beian"
 version = "0.1.0"
 description = "Query ICP beian like whois"
 readme = "README.md"
+license = "GPL-2.0-or-later"
 requires-python = ">=3.10"
+authors = [
+    { name = "Hung-I WANG", email = "whygowe@gmail.com" },
+]
+keywords = ["icp", "beian", "miit", "备案", "查询"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet",
+    "Topic :: Security",
+]
 dependencies = [
     "ddddocr>=1.6.1",
     "playwright>=1.40",
     "requests>=2.31",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Gowee/beian-cli"
+Repository = "https://github.com/Gowee/beian-cli"
+Issues = "https://github.com/Gowee/beian-cli/issues"
 
 [project.scripts]
 beian = "beian.cli:main"
