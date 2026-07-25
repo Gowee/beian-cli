@@ -9,7 +9,7 @@ Query ICP registration info from MIIT's official system. Solves CAPTCHA automati
 ## Install
 
 ```bash
-uvx beian
+uvx beian --help
 ```
 
 Or install permanently:
