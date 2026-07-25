@@ -5,6 +5,7 @@ description = "CLI tool for querying ICP registration info from MIIT"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "ddddocr>=1.6.1",
     "playwright>=1.40",
 ]
 

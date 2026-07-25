@@ -1,12 +1,19 @@
 """CLI tool for querying ICP registration info from MIIT (beian.miit.gov.cn)."""
 
 import argparse
+import base64
+import http.cookiejar
 import json
 import os
 import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
+
+import cv2
+import numpy as np
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
@@ -137,6 +144,7 @@ QUERY_TYPE_LABELS = {
     6: "APP",
     7: "小程序",
     8: "快应用",
+    "license": "增值电信业务经营许可证",
 }
 
 # ---------------------------------------------------------------------------
@@ -438,6 +446,241 @@ def _extract_results_from_dom(page, query: str, service_type: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ICP license query (tsm.miit.gov.cn)
+# ---------------------------------------------------------------------------
+
+def _edge_sharp(img_bytes: bytes) -> bytes:
+    """Preprocess CAPTCHA: edge enhance + sharpen for ddddocr."""
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Edge enhance
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_n = (np.abs(lap) / (np.abs(lap).max() + 1e-6) * 255).astype(np.uint8)
+    lc = np.stack([lap_n] * 3, axis=-1)
+    ee = cv2.addWeighted(img, 1.5, lc, -0.5, 0)
+    # Sharpen
+    blur = cv2.GaussianBlur(ee, (0, 0), 1.5)
+    r = cv2.addWeighted(ee, 2.0, blur, -1.0, 0)
+    _, buf = cv2.imencode(".png", r)
+    return buf.tobytes()
+
+
+def _parse_annual_report(html: str) -> dict | None:
+    """Parse年报 JSP page HTML into key-value dict."""
+    tds = re.findall(r'<td[^>]*>(.*?)</td>', html, re.DOTALL)
+    cleaned = [re.sub(r'<[^>]+>', '', c).strip() for c in tds]
+    if len(cleaned) < 9:
+        return None
+    # Table structure: 序号, 指标名称, 单位/值 repeating
+    fields = {}
+    for i in range(0, len(cleaned) - 2, 3):
+        seq, name, val = cleaned[i], cleaned[i + 1], cleaned[i + 2]
+        if name and val and name != "指标名称":
+            fields[name] = val
+    if not fields:
+        return None
+    return {
+        "fillYear": fields.get("填报年度", ""),
+        "enterpriseName": fields.get("企业名称", ""),
+        "creditCode": fields.get("统一社会信用代码", ""),
+        "legalPerson": fields.get("法定代表人", ""),
+        "licenseNo": fields.get("许可证编码", ""),
+        "address": fields.get("注册住所", ""),
+        "region": fields.get("注册属地", ""),
+        "registeredCapital": fields.get("注册资本", ""),
+        "businessTypes": fields.get("许可证业务种类", ""),
+        "enterpriseNature": fields.get("企业性质", ""),
+        "stockStatus": fields.get("上市情况", ""),
+        "servicePhone": fields.get("客户投诉服务电话", ""),
+        "complaintCount": fields.get("用户投诉量", ""),
+        "complaintReplyRate": fields.get("用户投诉回复率", ""),
+    }
+
+
+def query_license_batch(queries: list[str], *, retries: int = 10) -> list[dict]:
+    """Query ICP license from tsm.miit.gov.cn for multiple company names."""
+    import ddddocr
+
+    ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
+    ocr.set_ranges("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+    # Create session with cookie jar
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"),
+        ("Referer", "https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp"),
+        ("X-Requested-With", "XMLHttpRequest"),
+    ]
+
+    # Load the page first to establish session
+    try:
+        page_req = urllib.request.Request("https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp?num=&type=xuke")
+        opener.open(page_req, timeout=10)
+    except Exception:
+        pass
+
+    # Cache for授权_info and年报_info keyed by lic_id
+    cache = {"auth": {}, "report": {}}
+
+    results = []
+    for query in queries:
+        result = _do_license_query(opener, query, ocr, retries, cache)
+        results.append(result)
+    return results
+
+
+def _do_license_query(opener, company: str, ocr, retries: int, cache: dict) -> dict:
+    """Solve CAPTCHA and query ICP license for one company.
+
+    Retry logic: non-7-char OCR results refresh CAPTCHA without counting as
+    a retry. 5 consecutive non-7-char results count as one failure.
+    """
+    for attempt in range(1, retries + 1):
+        non7_count = 0
+        while non7_count < 5:
+            try:
+                # Get CAPTCHA
+                data = urllib.parse.urlencode({"num": company}).encode()
+                req = urllib.request.Request(
+                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getCode", data=data)
+                resp = opener.open(req, timeout=10)
+                captcha = json.loads(resp.read())
+                img_bytes = base64.b64decode(captcha["src"].split(",")[1])
+
+                # OCR with edge_sharp preprocessing
+                processed = _edge_sharp(img_bytes)
+                code = ocr.classification(processed)
+
+                if len(code) != 7:
+                    non7_count += 1
+                    continue
+
+                # Submit
+                data2 = urllib.parse.urlencode({
+                    "num": company, "type": "xuke", "code": code,
+                }).encode()
+                req2 = urllib.request.Request(
+                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getcorpinfocount.wf",
+                    data=data2)
+                resp2 = opener.open(req2, timeout=10)
+                check = json.loads(resp2.read())
+
+                if check.get("flag") == "0":
+                    break  # Wrong CAPTCHA, count this as one failure
+
+                # Get results
+                data3 = urllib.parse.urlencode({
+                    "num": company, "type": "xuke", "code": code,
+                    "pageNum": 1, "pageSize": 100,
+                }).encode()
+                req3 = urllib.request.Request(
+                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getcorpinfo.wf",
+                    data=data3)
+                resp3 = opener.open(req3, timeout=10)
+                body = json.loads(resp3.read())
+
+                records = []
+                for item in (body.get("listyj") or []):
+                    ywzl_infos = item.get("ywzlInfos") or []
+                    lic_id = item.get("lic_id", "")
+
+                    # Fetch授权_info (cached by lic_id)
+                    authorizations = []
+                    if lic_id:
+                        if lic_id in cache["auth"]:
+                            authorizations = cache["auth"][lic_id]
+                        else:
+                            try:
+                                auth_data = urllib.parse.urlencode({"num": lic_id}).encode()
+                                auth_req = urllib.request.Request(
+                                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getshouquan.wf?pageNum=1&pageSize=100",
+                                    data=auth_data)
+                                auth_resp = opener.open(auth_req, timeout=10)
+                                auth_body = json.loads(auth_resp.read())
+                                if isinstance(auth_body, list):
+                                    authorizations = auth_body
+                                cache["auth"][lic_id] = authorizations
+                            except Exception:
+                                cache["auth"][lic_id] = []
+
+                    # Fetch年报_info (cached by lic_id)
+                    annual_report = None
+                    if lic_id:
+                        if lic_id in cache["report"]:
+                            annual_report = cache["report"][lic_id]
+                        else:
+                            fill_year = ""
+                            try:
+                                ar_data = urllib.parse.urlencode({"num": lic_id}).encode()
+                                ar_req = urllib.request.Request(
+                                    "https://tsm.miit.gov.cn/dxxzsp/corpinfo/getreporty",
+                                    data=ar_data)
+                                ar_resp = opener.open(ar_req, timeout=10)
+                                ar_body = json.loads(ar_resp.read())
+                                if ar_body and not ar_body.get("ssss"):
+                                    fill_year = ar_body.get("FILL_YEAR", "")
+                            except Exception:
+                                pass
+                            try:
+                                ar_req2 = urllib.request.Request(
+                                    f"https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyereport.jsp?num={lic_id}&type=yreport")
+                                ar_resp2 = opener.open(ar_req2, timeout=10)
+                                ar_html = ar_resp2.read().decode("utf-8", errors="replace")
+                                annual_report = _parse_annual_report(ar_html)
+                                if annual_report:
+                                    annual_report["fillYear"] = fill_year
+                            except Exception:
+                                pass
+                            cache["report"][lic_id] = annual_report
+
+                    rec = {
+                        "companyName": item.get("company_name", ""),
+                        "legalPerson": item.get("faren", ""),
+                        "licenseNo": item.get("license_no", ""),
+                        "issuingAuthority": item.get("fzjg", ""),
+                        "businessTypes": [
+                            {
+                                "scope": y.get("ywzl", ""),
+                                "serviceArea": y.get("fgfw", ""),
+                                "issueDate": y.get("fzrq", "") or "----------",
+                                "expiryDate": y.get("jzrq", ""),
+                            }
+                            for y in ywzl_infos
+                        ],
+                        "authorizations": [
+                            {
+                                "parentCompany": a.get("name", ""),
+                                "subsidiary": a.get("nameints", ""),
+                                "scope": a.get("yewu", ""),
+                                "licenseNo": a.get("num", ""),
+                            }
+                            for a in authorizations
+                        ],
+                    }
+                    if annual_report:
+                        rec["annualReport"] = annual_report
+                    records.append(rec)
+
+                return {
+                    "query": company,
+                    "queryType": "增值电信业务经营许可证",
+                    "queryTime": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total": int(check.get("c", len(records))),
+                    "records": records,
+                }
+
+            except Exception:
+                break  # Network error, count as one failure
+
+        if attempt == retries:
+            return {"error": f"Failed after {retries} attempts", "query": company}
+
+    return {"error": f"Failed after {retries} attempts", "query": company}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -457,8 +700,10 @@ def main():
                         const="miniprogram", help="Query miniprogram registration")
     parser.add_argument("--quickapp", action="store_const", dest="query_type",
                         const="quickapp", help="Query quick app registration")
+    parser.add_argument("--license", action="store_const", dest="query_type",
+                        const="license", help="Query ICP license (增值电信业务经营许可证)")
     parser.add_argument("--retries", type=int, default=3,
-                        help="Max CAPTCHA solve attempts (default: 3)")
+                        help="Max CAPTCHA solve attempts (default: 3, ICP license)")
     parser.add_argument("--timeout", type=int, default=30,
                         help="Page timeout in seconds (default: 30)")
     parser.add_argument("--no-headless", action="store_true",
@@ -472,14 +717,21 @@ def main():
     if not args.query_type:
         args.query_type = "website"
 
-    results = query_beian_batch(
-        args.queries,
-        headless=not args.no_headless,
-        timeout_ms=args.timeout * 1000,
-        retries=args.retries,
-        query_type=args.query_type,
-        screenshot_dir=args.screenshot,
-    )
+    # ICP license uses different query path (no browser needed)
+    if args.query_type == "license":
+        results = query_license_batch(
+            args.queries,
+            retries=args.retries,
+        )
+    else:
+        results = query_beian_batch(
+            args.queries,
+            headless=not args.no_headless,
+            timeout_ms=args.timeout * 1000,
+            retries=args.retries,
+            query_type=args.query_type,
+            screenshot_dir=args.screenshot,
+        )
 
     if args.raw:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -512,6 +764,12 @@ def _print_result(result: dict):
         print()
         return
 
+    # ICP license format
+    if result.get("queryType") == "增值电信业务经营许可证":
+        _print_license_records(result)
+        return
+
+    # ICP filing format
     labels = {
         "mainLicence":    "ICP备案/许可证号",
         "unitName":       "主办单位名称",
@@ -535,6 +793,54 @@ def _print_result(result: dict):
             for k in service:
                 if rec.get(k):
                     print(f"    {labels[k]}：  {rec[k]}")
+        print()
+
+
+def _print_license_records(result: dict):
+    """Print ICP license records in vertical format for terminal readability."""
+    for i, rec in enumerate(result["records"], 1):
+        if len(result["records"]) > 1:
+            print(f"  === 许可证 {i} ===")
+        print(f"  公司名称：      {rec['companyName']}")
+        print(f"  法定代表人：    {rec['legalPerson']}")
+        print(f"  许可证号：      {rec['licenseNo']}")
+        print(f"  发证机关：      {rec['issuingAuthority']}")
+
+        if rec["businessTypes"]:
+            print(f"  业务种类：")
+            for j, bt in enumerate(rec["businessTypes"], 1):
+                print(f"    [{j}] {bt['scope']}")
+                print(f"        覆盖范围：{bt['serviceArea']}")
+                print(f"        发证日期：{bt['issueDate']}")
+                print(f"        有效期至：{bt['expiryDate']}")
+
+        if rec.get("authorizations"):
+            print(f"  授权信息：")
+            for j, auth in enumerate(rec["authorizations"], 1):
+                print(f"    [{j}] 持证公司：{auth['parentCompany']}")
+                print(f"        授权子公司：{auth['subsidiary']}")
+                print(f"        许可证号：{auth['licenseNo']}")
+                print(f"        授权业务及范围：{auth['scope'][:100]}...")
+
+        ar = rec.get("annualReport")
+        if ar:
+            print(f"  年报公示（{ar.get('fillYear', '')}）：")
+            for k, v in [
+                ("企业名称", ar.get("enterpriseName", "")),
+                ("统一社会信用代码", ar.get("creditCode", "")),
+                ("法定代表人", ar.get("legalPerson", "")),
+                ("许可证编码", ar.get("licenseNo", "")),
+                ("注册住所", ar.get("address", "")),
+                ("注册属地", ar.get("region", "")),
+                ("注册资本", ar.get("registeredCapital", "")),
+                ("企业性质", ar.get("enterpriseNature", "")),
+                ("上市情况", ar.get("stockStatus", "")),
+                ("客户投诉服务电话", ar.get("servicePhone", "")),
+                ("用户投诉量", ar.get("complaintCount", "")),
+                ("用户投诉回复率", ar.get("complaintReplyRate", "")),
+            ]:
+                if v:
+                    print(f"    {k}：{v}")
         print()
 
 
