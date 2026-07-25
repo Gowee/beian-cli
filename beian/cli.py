@@ -541,11 +541,11 @@ def _do_license_query(session: requests.Session, company: str, ocr, retries: int
     """Solve CAPTCHA and query ICP license for one company.
 
     Retry logic: non-7-char OCR results refresh CAPTCHA without counting as
-    a retry. 5 consecutive non-7-char results count as one failure.
+    a retry. 10 consecutive non-7-char results count as one failure.
     """
     for attempt in range(1, retries + 1):
         non7_count = 0
-        while non7_count < 5:
+        while non7_count < 10:
             try:
                 # Get CAPTCHA
                 if verbose:
@@ -725,7 +725,7 @@ def main():
                         const="quickapp", help="Query quick app registration")
     parser.add_argument("--license", action="store_const", dest="query_type",
                         const="license", help="Query ICP license (增值电信业务经营许可证)")
-    parser.add_argument("--retries", type=int, default=3,
+    parser.add_argument("--retry", type=int, default=3,
                         help="Max CAPTCHA solve attempts (default: 3, ICP license)")
     parser.add_argument("--timeout", type=int, default=30,
                         help="Page timeout in seconds (default: 30)")
@@ -746,7 +746,7 @@ def main():
     if args.query_type == "license":
         results = query_license_batch(
             args.queries,
-            retries=args.retries,
+            retries=args.retry,
             verbose=args.verbose,
         )
     else:
@@ -754,7 +754,7 @@ def main():
             args.queries,
             headless=not args.no_headless,
             timeout_ms=args.timeout * 1000,
-            retries=args.retries,
+            retries=args.retry,
             query_type=args.query_type,
             screenshot_dir=args.screenshot,
         )
