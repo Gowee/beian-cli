@@ -162,7 +162,8 @@ def query_beian(query: str, *, headless: bool = True, timeout_ms: int = 30_000,
 def query_beian_batch(queries: list[str], *, headless: bool = True,
                       timeout_ms: int = 30_000, retries: int = 3,
                       query_type: str = "website",
-                      screenshot_dir: str | None = None) -> list[dict]:
+                      screenshot_dir: str | None = None,
+                      verbose: bool = False) -> list[dict]:
     """Query MIIT for multiple terms in one browser session."""
     service_type = QUERY_TYPES.get(query_type)
     if service_type is None:
@@ -217,7 +218,8 @@ def query_beian_batch(queries: list[str], *, headless: bool = True,
                         timeout=15_000,
                     )
                 results.append(_do_query(page, q, retries, service_type,
-                                         screenshot_dir=screenshot_dir))
+                                         screenshot_dir=screenshot_dir,
+                                         verbose=verbose))
         finally:
             ctx.close()
             browser.close()
@@ -226,8 +228,11 @@ def query_beian_batch(queries: list[str], *, headless: bool = True,
 
 
 def _do_query(page, query: str, retries: int, service_type: int,
-              *, screenshot_dir: str | None = None) -> dict:
+              *, screenshot_dir: str | None = None,
+              verbose: bool = False) -> dict:
     # 1. Load the site – networkidle is reliable for this SPA
+    if verbose:
+        print(f"    [{query[:12]}...] Loading page...", file=sys.stderr)
     page.goto("https://beian.miit.gov.cn/#/Integrated/recordQuery",
               wait_until="networkidle")
 
@@ -242,6 +247,8 @@ def _do_query(page, query: str, retries: int, service_type: int,
         }""",
         timeout=15_000,
     )
+    if verbose:
+        print(f"    [{query[:12]}...] Page ready, triggering search...", file=sys.stderr)
 
     # 2. Type query, set radio, and trigger search
     page.evaluate("""([query, serviceType]) => {
@@ -256,17 +263,25 @@ def _do_query(page, query: str, retries: int, service_type: int,
     # 4. Wait for CAPTCHA images to be ready
     page.wait_for_selector("#bgImg", state="attached", timeout=10_000)
     page.wait_for_function(WAIT_CAPTCHA_READY_JS, timeout=10_000)
+    if verbose:
+        print(f"    [{query[:12]}...] CAPTCHA loaded", file=sys.stderr)
 
     # 5. Solve CAPTCHA (with retries)
     for attempt in range(1, retries + 1):
+        if verbose:
+            print(f"    [{query[:12]}...] CAPTCHA attempt {attempt}/{retries}...", file=sys.stderr, end=" ")
         result = page.evaluate(DETECT_GAP_JS)
         if "error" in result:
+            if verbose:
+                print(f"detection error: {result['error']}", file=sys.stderr)
             if attempt < retries:
                 _refresh_captcha(page)
                 continue
             return {"error": result["error"]}
 
         displacement = result["displacement"]
+        if verbose:
+            print(f"displacement={displacement}px", file=sys.stderr, end=" ")
 
         def _match_check(r):
             return "image/checkImage" in r.url
@@ -293,21 +308,32 @@ def _do_query(page, query: str, retries: int, service_type: int,
             check_body = check_info.value.json()
             if not check_body.get("success", False):
                 # Wrong answer — fail fast
+                if verbose:
+                    print("WRONG CAPTCHA", file=sys.stderr)
                 if attempt < retries:
                     _wait_for_captcha_refresh(page)
                 continue
 
+            if verbose:
+                print("OK", file=sys.stderr, end=" ")
+
             # CAPTCHA passed — search response captured
             result = _parse_api_response(search_info.value.json(), query, service_type)
+            if verbose:
+                print(f"-> {result.get('total', 0)} records", file=sys.stderr)
             if screenshot_dir:
                 _take_screenshot(page, query, screenshot_dir)
             return result
 
         except PwTimeout:
+            if verbose:
+                print("TIMEOUT", file=sys.stderr)
             if attempt < retries:
                 _wait_for_captcha_refresh(page)
                 continue
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print(f"ERROR: {e}", file=sys.stderr)
             if attempt < retries:
                 _wait_for_captcha_refresh(page)
                 continue
@@ -721,8 +747,8 @@ def main():
                         const="quickapp", help="Query quick app registration")
     parser.add_argument("--license", action="store_const", dest="query_type",
                         const="license", help="Query ICP license (增值电信业务经营许可证)")
-    parser.add_argument("--retry", type=int, default=3,
-                        help="Max CAPTCHA solve attempts (default: 3, ICP license)")
+    parser.add_argument("--retry", type=int, default=5,
+                        help="Max CAPTCHA solve attempts (default: 5)")
     parser.add_argument("--timeout", type=int, default=30,
                         help="Page timeout in seconds (default: 30)")
     parser.add_argument("--no-headless", action="store_true",
@@ -733,7 +759,7 @@ def main():
                         metavar="DIR",
                         help="Save full-page screenshot (default: current dir)")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Show progress (ICP license CAPTCHA solving)")
+                        help="Show progress (CAPTCHA solving, API calls)")
     args = parser.parse_args()
     if not args.query_type:
         args.query_type = "website"
@@ -753,6 +779,7 @@ def main():
             retries=args.retry,
             query_type=args.query_type,
             screenshot_dir=args.screenshot,
+            verbose=args.verbose,
         )
 
     if args.raw:
