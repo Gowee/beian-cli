@@ -512,14 +512,6 @@ def query_license_batch(queries: list[str], *, retries: int = 10,
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # Load the page first to establish session
-    if verbose:
-        print("  [init] Loading session...", file=sys.stderr)
-    try:
-        session.get("https://tsm.miit.gov.cn/dxxzsp/xkz/xkzgl/resource/qiyesearch.jsp",
-                     params={"num": "", "type": "xuke"}, timeout=10)
-    except Exception:
-        pass
     if verbose:
         print("  [init] Session ready", file=sys.stderr)
 
