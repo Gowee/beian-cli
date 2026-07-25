@@ -193,9 +193,13 @@ def query_beian_batch(queries: list[str], *, headless: bool = True,
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
+        # Block non-essential resources
         page.route("**/*.{woff,woff2,ttf,otf}", lambda route: route.abort())
         page.route("**/analytics**", lambda route: route.abort())
         page.route("**/gtm**", lambda route: route.abort())
+        page.route("**/latestMessage**", lambda route: route.abort())
+        page.route("**/portalHomePage**", lambda route: route.abort())
+        page.route("**/queryOneUpgradeNoticeInfo**", lambda route: route.abort())
 
         try:
             for i, q in enumerate(queries):
