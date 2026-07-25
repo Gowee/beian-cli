@@ -1,7 +1,7 @@
 [project]
-name = "beian-cli"
+name = "beian"
 version = "0.1.0"
-description = "CLI tool for querying ICP registration info from MIIT"
+description = "Query ICP beian like whois"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
