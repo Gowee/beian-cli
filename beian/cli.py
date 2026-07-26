@@ -614,11 +614,11 @@ def _edge_sharp(img_bytes: bytes) -> bytes:
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_n = (np.abs(lap) / (np.abs(lap).max() + 1e-6) * 255).astype(np.uint8)
     lc = np.stack([lap_n] * 3, axis=-1)
-    ee = cv2.addWeighted(img, 2.0, lc, -1.0, 0)
+    ee = cv2.addWeighted(img, 1.5, lc, -0.5, 0)
     # Sharpen
-    blur = cv2.GaussianBlur(ee, (0, 0), 2)
+    blur = cv2.GaussianBlur(ee, (0, 0), 1.5)
     r = cv2.addWeighted(ee, 2.0, blur, -1.0, 0)
-    _, buf = cv2.imencode(".jpg", r, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    _, buf = cv2.imencode(".png", r)
     return buf.tobytes()
 
 
