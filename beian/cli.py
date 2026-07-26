@@ -1,19 +1,18 @@
 """CLI tool for querying ICP registration info from MIIT (beian.miit.gov.cn)."""
 
 import argparse
+import asyncio
 import base64
 import json
 import os
 import re
 import sys
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 
+import requests
 import cv2
 import numpy as np
-import requests
-
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+from playwright.async_api import async_playwright, TimeoutError as APwTimeout
 
 # ---------------------------------------------------------------------------
 # Gap detection algorithm – runs inside the browser page context via
@@ -113,15 +112,20 @@ async () => {
 """
 
 # JS that waits for CAPTCHA images to fully decode (event-based, no sleep)
+# Accepts optional oldSrc to wait for a NEW image (src changed)
 WAIT_CAPTCHA_READY_JS = """\
-async () => {
+async (oldSrc) => {
     const bgImg = document.getElementById('bgImg');
     const sildeImg = document.getElementById('sildeImg');
     if (!bgImg || !sildeImg) return false;
-    // Wait until images have valid dimensions (decoded)
+    // Wait until images have valid dimensions AND src changed (if oldSrc given)
     for (let i = 0; i < 80; i++) {
-        if (bgImg.complete && bgImg.naturalWidth > 0 &&
-            sildeImg.complete && sildeImg.naturalWidth > 0) return true;
+        const ready = bgImg.complete && bgImg.naturalWidth > 0 &&
+                      sildeImg.complete && sildeImg.naturalWidth > 0;
+        if (ready) {
+            if (!oldSrc) return true;
+            if (bgImg.src !== oldSrc) return true;
+        }
         await new Promise(r => setTimeout(r, 100));
     }
     return false;
@@ -165,50 +169,69 @@ def query_beian_batch(queries: list[str], *, headless: bool = True,
                       screenshot_dir: str | None = None,
                       verbose: bool = False) -> list[dict]:
     """Query MIIT for multiple terms in one browser session."""
+    return asyncio.run(_query_beian_batch_async(
+        queries, headless=headless, timeout_ms=timeout_ms,
+        retries=retries, query_type=query_type,
+        screenshot_dir=screenshot_dir, verbose=verbose,
+    ))
+
+
+async def _query_beian_batch_async(queries: list[str], *, headless: bool = True,
+                                   timeout_ms: int = 30_000, retries: int = 3,
+                                   query_type: str = "website",
+                                   screenshot_dir: str | None = None,
+                                   verbose: bool = False) -> list[dict]:
+    """Async implementation of batch filing query."""
     service_type = QUERY_TYPES.get(query_type)
     if service_type is None:
         raise ValueError(f"Unknown query type: {query_type!r}. "
                          f"Choose from: {', '.join(QUERY_TYPES)}")
 
     results = []
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
+    async with async_playwright() as pw:
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-font-subpixel-positioning",
+            "--disable-extensions",
+        ]
+        if verbose:
+            print(f"  [init] headless={headless}, timeout={timeout_ms}ms", file=sys.stderr)
+            print(f"  [init] browser args: {browser_args}", file=sys.stderr)
+        browser = await pw.chromium.launch(
             headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-font-subpixel-positioning",
-                "--disable-extensions",
-            ],
+            args=browser_args,
         )
-        ctx = browser.new_context(
+        ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
         )
-        page = ctx.new_page()
+        page = await ctx.new_page()
         page.set_default_timeout(timeout_ms)
+        if verbose:
+            print(f"  [init] context+page created", file=sys.stderr)
 
-        page.add_init_script("""
+        await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
         # Block non-essential resources
-        page.route("**/*.{woff,woff2,ttf,otf}", lambda route: route.abort())
-        page.route("**/analytics**", lambda route: route.abort())
-        page.route("**/gtm**", lambda route: route.abort())
-        page.route("**/latestMessage**", lambda route: route.abort())
-        page.route("**/portalHomePage**", lambda route: route.abort())
-        page.route("**/queryOneUpgradeNoticeInfo**", lambda route: route.abort())
+        await page.route("**/*.{woff,woff2,ttf,otf}", lambda route: route.abort())
+        await page.route("**/analytics**", lambda route: route.abort())
+        await page.route("**/gtm**", lambda route: route.abort())
+        await page.route("**/latestMessage**", lambda route: route.abort())
+        await page.route("**/portalHomePage**", lambda route: route.abort())
+        await page.route("**/queryOneUpgradeNoticeInfo**", lambda route: route.abort())
 
         try:
             for i, q in enumerate(queries):
                 if i > 0:
                     # Navigate back to index for next query
-                    page.goto("https://beian.miit.gov.cn/#/Integrated/recordQuery",
-                              wait_until="networkidle")
-                    page.wait_for_function(
+                    await page.goto("https://beian.miit.gov.cn/#/Integrated/recordQuery",
+                                    wait_until="networkidle")
+                    await page.wait_for_function(
                         """() => {
                             const el = document.getElementById('app');
                             if (!el || !el.__vue__) return false;
@@ -217,27 +240,27 @@ def query_beian_batch(queries: list[str], *, headless: bool = True,
                         }""",
                         timeout=15_000,
                     )
-                results.append(_do_query(page, q, retries, service_type,
-                                         screenshot_dir=screenshot_dir,
-                                         verbose=verbose))
+                results.append(await _do_query(page, q, retries, service_type,
+                                               screenshot_dir=screenshot_dir,
+                                               verbose=verbose))
         finally:
-            ctx.close()
-            browser.close()
+            await ctx.close()
+            await browser.close()
 
     return results
 
 
-def _do_query(page, query: str, retries: int, service_type: int,
-              *, screenshot_dir: str | None = None,
-              verbose: bool = False) -> dict:
+async def _do_query(page, query: str, retries: int, service_type: int,
+                    *, screenshot_dir: str | None = None,
+                    verbose: bool = False) -> dict:
     # 1. Load the site – networkidle is reliable for this SPA
     if verbose:
         print(f"    [{query[:12]}...] Loading page...", file=sys.stderr)
-    page.goto("https://beian.miit.gov.cn/#/Integrated/recordQuery",
-              wait_until="networkidle")
+    await page.goto("https://beian.miit.gov.cn/#/Integrated/recordQuery",
+                     wait_until="networkidle")
 
     # 1b. Wait for Vue to initialise
-    page.wait_for_function(
+    await page.wait_for_function(
         """() => {
             const el = document.getElementById('app');
             if (!el || !el.__vue__) return false;
@@ -251,7 +274,7 @@ def _do_query(page, query: str, retries: int, service_type: int,
         print(f"    [{query[:12]}...] Page ready, triggering search...", file=sys.stderr)
 
     # 2. Type query, set radio, and trigger search
-    page.evaluate("""([query, serviceType]) => {
+    await page.evaluate("""([query, serviceType]) => {
         const app = document.getElementById('app').__vue__;
         const integrated = app.$children.find(
             c => c.$el.classList.contains('Integrated'));
@@ -261,21 +284,27 @@ def _do_query(page, query: str, retries: int, service_type: int,
     }""", [query, service_type])
 
     # 4. Wait for CAPTCHA images to be ready
-    page.wait_for_selector("#bgImg", state="attached", timeout=10_000)
-    page.wait_for_function(WAIT_CAPTCHA_READY_JS, timeout=10_000)
+    await page.wait_for_selector("#bgImg", state="attached", timeout=10_000)
+    await page.wait_for_function(WAIT_CAPTCHA_READY_JS, timeout=10_000)
     if verbose:
         print(f"    [{query[:12]}...] CAPTCHA loaded", file=sys.stderr)
 
     # 5. Solve CAPTCHA (with retries)
     for attempt in range(1, retries + 1):
+        # Capture current src before attempt (for new-image detection after refresh)
+        old_src = await page.evaluate("""() => {
+            const bg = document.getElementById('bgImg');
+            return bg ? bg.src : '';
+        }""")
         if verbose:
             print(f"    [{query[:12]}...] CAPTCHA attempt {attempt}/{retries}...", file=sys.stderr, end=" ")
-        result = page.evaluate(DETECT_GAP_JS)
+        result = await page.evaluate(DETECT_GAP_JS)
         if "error" in result:
             if verbose:
                 print(f"detection error: {result['error']}", file=sys.stderr)
             if attempt < retries:
-                _refresh_captcha(page)
+                await _refresh_captcha(page)
+                await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
                 continue
             return {"error": result["error"]}
 
@@ -283,60 +312,103 @@ def _do_query(page, query: str, retries: int, service_type: int,
         if verbose:
             print(f"displacement={displacement}px", file=sys.stderr, end=" ")
 
-        def _match_check(r):
-            return "image/checkImage" in r.url
+        # Capture responses via on("response") — fires even during page.evaluate
+        captured_check = {}
+        captured_search = {}
 
-        def _match_search(r):
-            return ("icpAbbreviateInfo" in r.url
-                    or "blackListDomain" in r.url)
+        def _on_check(resp):
+            if "image/checkImage" in resp.url:
+                captured_check["resp"] = resp
+
+        def _on_search(resp):
+            u = resp.url
+            if "icpAbbreviateInfo" in u or "blackListDomain" in u:
+                captured_search["resp"] = resp
+
+        page.on("response", _on_check)
+        page.on("response", _on_search)
 
         try:
-            # Set up BOTH expect_response before triggering checkImg
-            # checkImage response arrives first, then search API
-            with page.expect_response(_match_check, timeout=5_000) as check_info:
-                with page.expect_response(_match_search, timeout=8_000) as search_info:
-                    page.evaluate("""(disp) => {
-                        const app = document.getElementById('app').__vue__;
-                        const integrated = app.$children.find(
-                            c => c.$el.classList.contains('Integrated'));
-                        integrated.puzzle = disp;
-                        integrated.checkImg();
-                        return true;
-                    }""", displacement)
+            await page.evaluate("""(disp) => {
+                const app = document.getElementById('app').__vue__;
+                const integrated = app.$children.find(
+                    c => c.$el.classList.contains('Integrated'));
+                integrated.puzzle = disp;
+                integrated.checkImg();
+                return true;
+            }""", displacement)
 
-            # checkImage response — verify success
-            check_body = check_info.value.json()
+            # Wait for checkImage response
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if "resp" in captured_check:
+                    break
+                await asyncio.sleep(0.05)
+
+            check_resp = captured_check.get("resp")
+            if check_resp is None:
+                if verbose:
+                    print("NO_CHECK_RESPONSE", file=sys.stderr, end=" ")
+                if attempt < retries:
+                    await _refresh_captcha(page)
+                    await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
+                    continue
+                return {"error": "No checkImage response"}
+
+            check_body = await check_resp.json()
             if not check_body.get("success", False):
-                # Wrong answer — fail fast
+                # Vue auto-refreshes CAPTCHA after failed checkImg()
                 if verbose:
                     print("WRONG CAPTCHA", file=sys.stderr)
                 if attempt < retries:
-                    _wait_for_captcha_refresh(page)
+                    await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
                 continue
 
             if verbose:
                 print("OK", file=sys.stderr, end=" ")
 
-            # CAPTCHA passed — search response captured
-            result = _parse_api_response(search_info.value.json(), query, service_type)
+            # Wait for search response
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if "resp" in captured_search:
+                    break
+                await asyncio.sleep(0.05)
+
+            search_resp = captured_search.get("resp")
+            if search_resp is None:
+                if verbose:
+                    print("NO_SEARCH_RESPONSE", file=sys.stderr)
+                if attempt < retries:
+                    await _refresh_captcha(page)
+                    await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
+                    continue
+                return {"error": "No search response"}
+
+            search_body = await search_resp.json()
+            result = _parse_api_response(search_body, query, service_type)
             if verbose:
                 print(f"-> {result.get('total', 0)} records", file=sys.stderr)
             if screenshot_dir:
-                _take_screenshot(page, query, screenshot_dir)
+                await _take_screenshot(page, query, screenshot_dir)
             return result
 
-        except PwTimeout:
+        except APwTimeout:
             if verbose:
                 print("TIMEOUT", file=sys.stderr)
             if attempt < retries:
-                _wait_for_captcha_refresh(page)
+                await _refresh_captcha(page)
+                await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
                 continue
         except Exception as e:
             if verbose:
                 print(f"ERROR: {e}", file=sys.stderr)
             if attempt < retries:
-                _wait_for_captcha_refresh(page)
+                await _refresh_captcha(page)
+                await page.wait_for_function(WAIT_CAPTCHA_READY_JS, arg=old_src, timeout=5_000)
                 continue
+        finally:
+            page.remove_listener("response", _on_check)
+            page.remove_listener("response", _on_search)
 
     return {"error": f"Failed after {retries} attempts", "query": query}
 
@@ -347,31 +419,39 @@ def _sanitize_filename(query: str) -> str:
     return name or "result"
 
 
-def _take_screenshot(page, query: str, screenshot_dir: str):
+async def _take_screenshot(page, query: str, screenshot_dir: str):
     """Take a full-page screenshot and save to directory."""
     os.makedirs(screenshot_dir, exist_ok=True)
     path = os.path.join(screenshot_dir, f"{_sanitize_filename(query)}.png")
-    page.screenshot(path=path, full_page=True)
+    await page.screenshot(path=path, full_page=True)
     print(f"Screenshot: {path}")
 
 
-def _refresh_captcha(page):
-    """Refresh CAPTCHA and wait for new images (event-based)."""
-    page.evaluate("""() => {
-        const app = document.getElementById('app').__vue__;
-        const integrated = app.$children.find(
-            c => c.$el.classList.contains('Integrated'));
-        integrated.getImg();
-    }""")
-    page.wait_for_function(WAIT_CAPTCHA_READY_JS, timeout=5_000)
+async def _refresh_captcha(page) -> tuple[bytes, bytes] | None:
+    """Refresh CAPTCHA by calling getImg() and intercept getCheckImagePoint response.
 
+    Returns (big_image_bytes, small_image_bytes) for immediate use, or None on failure.
+    """
+    def _match_getimg(r):
+        return "getCheckImagePoint" in r.url
 
-def _wait_for_captcha_refresh(page):
-    """After failed checkImg, Vue auto-refreshes CAPTCHA – wait for it."""
     try:
-        page.wait_for_function(WAIT_CAPTCHA_READY_JS, timeout=5_000)
-    except PwTimeout:
+        async with page.expect_response(_match_getimg, timeout=8_000) as resp_info:
+            await page.evaluate("""() => {
+                const app = document.getElementById('app').__vue__;
+                const integrated = app.$children.find(
+                    c => c.$el.classList.contains('Integrated'));
+                integrated.getImg();
+            }""")
+        body = await (await resp_info.value).json()
+        params = body.get("params") or {}
+        big_b64 = params.get("bigImage", "")
+        small_b64 = params.get("smallImage", "")
+        if big_b64 and small_b64:
+            return (base64.b64decode(big_b64), base64.b64decode(small_b64))
+    except APwTimeout:
         pass
+    return None
 
 
 def _parse_api_response(resp: dict, query: str, service_type: int) -> dict:
@@ -402,75 +482,124 @@ def _parse_api_response(resp: dict, query: str, service_type: int) -> dict:
     }
 
 
-def _extract_results_from_dom(page, query: str, service_type: int) -> dict:
-    """Fallback: extract results from DOM when API response wasn't captured."""
-    # Check for explicit empty state
-    empty = page.evaluate("""() => {
-        const el = document.querySelector('.el-table__empty-text');
-        return el ? el.innerText.trim() : null;
-    }""")
-    if empty:
-        return {
-            "query": query,
-            "queryType": QUERY_TYPE_LABELS.get(service_type, str(service_type)),
-            "queryTime": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "total": 0,
-            "records": [],
-        }
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    # Try table rows
-    data = page.evaluate("""() => {
-        const rows = document.querySelectorAll(
-            '.el-table__body-wrapper table tbody tr');
-        const results = [];
-        for (const row of rows) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length >= 5) {
-                const unitName = cells[1]?.innerText?.trim() || '';
-                if (unitName.includes('function') || unitName.includes('var ')) continue;
-                results.push({
-                    unitName:       unitName,
-                    nature:         cells[2]?.innerText?.trim() || '',
-                    serviceLicence: cells[3]?.innerText?.trim() || '',
-                    mainLicence:    '',
-                    domain:         '',
-                    updateDate:     cells[4]?.innerText?.trim() || '',
-                });
-            }
-        }
-        return results;
-    }""")
+def main():
+    parser = argparse.ArgumentParser(
+        prog="beian",
+        description="Query ICP registration info from MIIT (beian.miit.gov.cn)",
+        epilog="Accepts: domain (baidu.com), unit name (北京百度网讯), or ICP number (京ICP证030173号)",
+    )
+    parser.add_argument("queries", nargs="+",
+                        help="Domain, unit name, or ICP filing number (one or more)")
+    parser.add_argument("--website", action="store_const", dest="query_type",
+                        const="website", help="Query website ICP (default)")
+    parser.add_argument("--app", action="store_const", dest="query_type",
+                        const="app", help="Query app registration")
+    parser.add_argument("--miniprogram", action="store_const", dest="query_type",
+                        const="miniprogram", help="Query miniprogram registration")
+    parser.add_argument("--quickapp", action="store_const", dest="query_type",
+                        const="quickapp", help="Query quick app registration")
+    parser.add_argument("--license", action="store_const", dest="query_type",
+                        const="license", help="Query ICP license (增值电信业务经营许可证)")
+    parser.add_argument("--retry", type=int, default=5,
+                        help="Max CAPTCHA solve attempts (default: 5)")
+    parser.add_argument("--timeout", type=int, default=30,
+                        help="Page timeout in seconds (default: 30)")
+    parser.add_argument("--no-headless", action="store_true",
+                        help="Run with visible browser (debug)")
+    parser.add_argument("--raw", action="store_true",
+                        help="Output raw JSON only, no formatting")
+    parser.add_argument("--screenshot", nargs="?", const=".", default=None,
+                        metavar="DIR",
+                        help="Save full-page screenshot (ICP filing queries only: --website/--app/--miniprogram/--quickapp). "
+                             "Default: current dir if flag used without value")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show progress (CAPTCHA solving, API calls)")
+    args = parser.parse_args()
+    if not args.query_type:
+        args.query_type = "website"
 
-    if not data:
-        # Try detail page
-        data = [page.evaluate("""() => {
-            const tds = Array.from(document.querySelectorAll('td'));
-            const map = {};
-            for (let i = 0; i < tds.length; i++) {
-                const text = tds[i].innerText.trim().replace(/[：:]/g, '');
-                const next = tds[i + 1];
-                if (next) map[text] = next.innerText.trim();
-            }
-            return {
-                unitName:       map['主办单位名称'] || '',
-                nature:         map['主办单位性质'] || '',
-                mainLicence:    map['ICP备案/许可证号'] || '',
-                serviceLicence: '',
-                domain:         map['网站域名'] || '',
-                updateDate:     map['审核通过日期'] || '',
-            };
-        }""")]
-        # If detail page also empty, return no records
-        if data and not data[0].get("unitName"):
-            data = []
+    if args.query_type == "license":
+        results = query_license_batch(
+            args.queries,
+            retries=args.retry,
+            verbose=args.verbose,
+        )
+    else:
+        results = query_beian_batch(
+            args.queries,
+            headless=not args.no_headless,
+            timeout_ms=args.timeout * 1000,
+            retries=args.retry,
+            query_type=args.query_type,
+            screenshot_dir=args.screenshot,
+            verbose=args.verbose,
+        )
 
-    return {
-        "query": query,
-        "queryType": QUERY_TYPE_LABELS.get(service_type, str(service_type)),
-        "queryTime": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "total": len(data),
-        "records": data,
+    if args.raw:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for i, r in enumerate(results):
+            if i > 0:
+                print("=" * 50)
+            _print_result(r)
+
+    sys.exit(0 if all("error" not in r for r in results) else 1)
+
+
+def _print_result(result: dict):
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        return
+
+    meta = [
+        ("Query", result["query"]),
+        ("Type", result.get("queryType", "网站")),
+        ("Query time", result["queryTime"]),
+        ("Records", str(result.get("total", len(result["records"])))),
+    ]
+    for label, val in meta:
+        print(f"{label + ':':14s} {val}")
+    print()
+
+    if not result["records"]:
+        print("  (no results)")
+        print()
+        return
+
+    # ICP license format
+    if result.get("queryType") == "增值电信业务经营许可证":
+        _print_license_records(result)
+        return
+
+    # ICP filing format
+    labels = {
+        "mainLicence":    "ICP备案/许可证号",
+        "unitName":       "主办单位名称",
+        "nature":         "主办单位性质",
+        "updateDate":     "审核通过日期",
+        "serviceLicence": "ICP备案/许可证号",
+        "domain":         "网站域名",
     }
+    ordered = ["mainLicence", "unitName", "nature", "updateDate"]
+    service = ["serviceLicence", "domain"]
+
+    for i, rec in enumerate(result["records"], 1):
+        if len(result["records"]) > 1:
+            print(f"--- Record {i} ---")
+        for k in ordered:
+            if rec.get(k):
+                print(f"  {labels[k]}：  {rec[k]}")
+        if any(rec.get(k) for k in service):
+            print()
+            print("  ICP备案服务信息")
+            for k in service:
+                if rec.get(k):
+                    print(f"    {labels[k]}：  {rec[k]}")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -485,11 +614,11 @@ def _edge_sharp(img_bytes: bytes) -> bytes:
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_n = (np.abs(lap) / (np.abs(lap).max() + 1e-6) * 255).astype(np.uint8)
     lc = np.stack([lap_n] * 3, axis=-1)
-    ee = cv2.addWeighted(img, 1.5, lc, -0.5, 0)
+    ee = cv2.addWeighted(img, 2.0, lc, -1.0, 0)
     # Sharpen
-    blur = cv2.GaussianBlur(ee, (0, 0), 1.5)
+    blur = cv2.GaussianBlur(ee, (0, 0), 2)
     r = cv2.addWeighted(ee, 2.0, blur, -1.0, 0)
-    _, buf = cv2.imencode(".png", r)
+    _, buf = cv2.imencode(".jpg", r, [cv2.IMWRITE_JPEG_QUALITY, 95])
     return buf.tobytes()
 
 
@@ -716,7 +845,9 @@ def _do_license_query(session: requests.Session, company: str, ocr, retries: int
                     "records": records,
                 }
 
-            except Exception:
+            except Exception as e:
+                if verbose:
+                    print(f"ERROR: {e}", file=sys.stderr)
                 break  # Network error, count as one failure
 
         if attempt == retries:
@@ -844,7 +975,6 @@ def _print_result(result: dict):
                 if rec.get(k):
                     print(f"    {labels[k]}：  {rec[k]}")
         print()
-
 
 def _print_license_records(result: dict):
     """Print ICP license records in vertical format for terminal readability."""
